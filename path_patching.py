@@ -851,3 +851,4 @@ def act_patch(
         node_name: t.tensor(results).reshape(list(patching_nodes.shape_values[node_name].values())) if isinstance(results[0], float) else results
         for node_name, results in results_dict.items()
     }
+
