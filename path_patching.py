@@ -1,4 +1,3 @@
-
 # %%
 
 import torch as t
@@ -231,12 +230,20 @@ class Node:
             return [self]
 
 
-    def get_patching_hook_fn(self, cache: ActivationCache, batch_indices: Union[slice, Int[Tensor, "batch pos"]], seq_pos_indices: Union[slice, Int[Tensor, "batch pos"]]) -> Callable:
+    def get_patching_hook_fn(self, cache: Union[str, ActivationCache], batch_indices: Union[slice, Int[Tensor, "batch pos"]], seq_pos_indices: Union[slice, Int[Tensor, "batch pos"]]) -> Callable:
         '''
         Returns a hook function for doing patching according to this node.
 
-        This is for step 2 of 3-step path patching (i.e. where we're patching the output of sender nodes), so we
-        assume that the node name is one of (z, post, or one of the resids).
+        This is used in 2 different ways:
+
+            (A) In step 2 of the 3-step path patching algorithm, where we're patching the output
+                of sender nodes from orig -> new cache. In this case, cache is an actual cache.
+
+            (B) In step 3 of the 3-step path patching algorithm, where we're patching the input
+                of receiver nodes with the values which were stored in context. In this case, cache
+                is actually a string (the key in the hook.ctx dict).
+
+        The key feature of this method is that it gives us a function which patches at specific sequence positions / heads / neurons. It doesn't just patch everywhere!
         '''
         def hook_fn(activations: Float[Tensor, "..."], hook: HookPoint) -> Float[Tensor, "..."]:
             # Define an index for slicing (by default slice(None), which is equivalent to [:])
@@ -256,7 +263,12 @@ class Node:
             if self.neuron is not None: idx[-1] = self.neuron
 
             # Now, patch the values in our activations tensor, and return the new activation values
-            activations[idx] = cache[hook.name][idx]
+            if isinstance(cache, str):
+                new_activations = hook.ctx[cache]
+            else:
+                new_activations = cache[hook.name]
+            
+            activations[idx] = new_activations[idx]
             return activations
 
         return hook_fn
@@ -547,6 +559,15 @@ def _path_patch_single(
         # Result - we've now cached the receiver nodes (i.e. stored them in the appropriate hook contexts)
 
 
+        # Lastly, we add the hooks for patching receivers (this is a bit different depending on our alg)
+        for node in receiver_nodes:
+            model.add_hook(
+                node.activation_name,
+                node.get_patching_hook_fn("receiver_activations", batch_indices, seq_pos_indices),
+                level=1
+            )
+
+
     else:
         # Calculate the (new_sender_output - orig_sender_output) for every sender, as something of shape d_model
         sender_diffs = {}
@@ -601,20 +622,34 @@ def _path_patch_single(
                         model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"] = t.zeros_like(orig_cache[receiver_node.activation_name])
                     model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices] += diff
                 
-                    
+
+
+        # Lastly, we add the hooks for patching receivers (this is a bit different depending on our alg)
+        for node in receiver_nodes:
+            model.add_hook(
+                node.activation_name,
+                partial(hook_fn_generic_patching_from_context, name="receiver_activations", add=True), 
+                level=1
+            )
+
+
+
+
 
 
     # Run model on orig with receiver nodes patched from previously cached values.
     # We do this by just having a single hook function: patch from the hook context, if we added it to the context (while caching receivers in the previous step)
-    model.add_hook(
-        get_hook_name_filter(model), 
-        partial(hook_fn_generic_patching_from_context, name="receiver_activations", add=not(direct_includes_mlps)), level=1
-    )
+    # model.add_hook(
+    #     get_hook_name_filter(model), 
+    #     partial(hook_fn_generic_patching_from_context, name="receiver_activations", add=not(direct_includes_mlps)), level=1
+    # )
     if apply_metric_to_cache:
         _, cache = model.run_with_cache(orig_input, return_type=None)
+        model.reset_hooks()
         return patching_metric(cache)
     else:
         logits = model(orig_input)
+        model.reset_hooks()
         return patching_metric(logits)
     
 
@@ -758,6 +793,7 @@ def path_patch(
             for (seq_pos, sender_node) in sender_node_list:
                 results_dict[sender_node_name].append(path_patch_single(sender=sender_node, receiver=receiver_nodes, seq_pos=seq_pos))
                 progress_bar.update(1)
+                t.cuda.empty_cache()
         progress_bar.close()
         for node_name, node_shape_dict in sender_nodes.shape_values.items():
             if verbose: print(f"results[{node_name!r}].shape = ({', '.join(f'{s}={v}' for s, v in node_shape_dict.items())})")
@@ -796,9 +832,11 @@ def _act_patch_single(
 
     if apply_metric_to_cache:
         _, cache = model.run_with_cache(orig_input, return_type=None)
+        model.reset_hooks()
         return patching_metric(cache)
     else:
         logits = model(orig_input)
+        model.reset_hooks()
         return patching_metric(logits)
 
 
@@ -844,6 +882,7 @@ def act_patch(
             node.seq_pos = seq_pos
             results_dict[node_name].append(act_patch_single(patching_nodes=node))
             progress_bar.update(1)
+            t.cuda.empty_cache()
     progress_bar.close()
     for node_name, node_shape_dict in patching_nodes.shape_values.items():
         if verbose: print(f"results[{node_name!r}].shape = ({', '.join(f'{s}={v}' for s, v in node_shape_dict.items())})")
