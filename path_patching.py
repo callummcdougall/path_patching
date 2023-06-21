@@ -352,7 +352,7 @@ class IterNode:
             # Add "seq_pos", if required
             if seq_pos == "each": self.shape_names[node].append("seq_pos")
             # Add "head" and "neuron", if required
-            if node in ["q", "k", "v", "z", "pattern"]: self.shape_names[node].append("head")
+            if node in ["q", "k", "v", "z", "result", "pattern"]: self.shape_names[node].append("head")
             if node in ["pre", "post"]: self.shape_names[node].append("neuron")
 
         # Result:
