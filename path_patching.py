@@ -122,7 +122,7 @@ class Node:
         self.seq_pos = seq_pos
 
         # Check if head dimension is appropriate
-        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "pattern"]):
+        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "result", "pattern"]):
             assert self.head is None, f"Can't specify `head` for activation {self.activation_name}."
 
         # Check if neuron dimension is appropriate
