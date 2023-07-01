@@ -123,7 +123,7 @@ class Node:
         self.seq_pos = seq_pos
 
         # Check if head dimension is appropriate
-        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "pattern"]):
+        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "result", "pattern"]):
             assert self.head is None, f"Can't specify `head` for activation {self.activation_name}."
 
         # Check if neuron dimension is appropriate
@@ -366,7 +366,7 @@ class IterNode:
             # Add "seq_pos", if required
             if seq_pos == "each": self.shape_names[node].append("seq_pos")
             # Add "head" and "neuron", if required
-            if node in ["q", "k", "v", "z", "pattern"]: self.shape_names[node].append("head")
+            if node in ["q", "k", "v", "z", "result", "pattern"]: self.shape_names[node].append("head")
             if node in ["pre", "post"]: self.shape_names[node].append("neuron")
 
         # Result:
