@@ -123,7 +123,7 @@ class Node:
         self.seq_pos = seq_pos
 
         # Check if head dimension is appropriate
-        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "result", "pattern"]):
+        if not any(name in self.activation_name for name in ["q", "k", "v", "z", "pattern"]):
             assert self.head is None, f"Can't specify `head` for activation {self.activation_name}."
 
         # Check if neuron dimension is appropriate
@@ -196,6 +196,7 @@ class Node:
         assert self.activation_name in model.hook_dict.keys(), f"Error: node '{self.activation_name}' is not in the hook dictionary."
 
         # Do main validity check
+        # TODO - allow "result", since there are use cases (e.g. if you're editing the new_cache directly)
         valid_sender_nodes = ["z", "attn_out", "post", "mlp_out", "resid_pre", "resid_post", "resid_mid"]
         assert self.component_name in valid_sender_nodes, f"Error: node '{self.component_name}' is not a valid sender node. Valid sender nodes are: {valid_sender_nodes}"
 
@@ -366,7 +367,7 @@ class IterNode:
             # Add "seq_pos", if required
             if seq_pos == "each": self.shape_names[node].append("seq_pos")
             # Add "head" and "neuron", if required
-            if node in ["q", "k", "v", "z", "result", "pattern"]: self.shape_names[node].append("head")
+            if node in ["q", "k", "v", "z", "pattern"]: self.shape_names[node].append("head")
             if node in ["pre", "post"]: self.shape_names[node].append("neuron")
 
         # Result:
@@ -472,11 +473,12 @@ def _path_patch_single(
     orig_input: Union[str, List[str], Int[Tensor, "batch pos"]],
     sender: Union[Node, List[Node]],
     receiver: Union[Node, List[Node]],
-    patching_metric: Callable,
+    patching_metric: Union[Callable, Literal["loss", "loss_per_token"]],
     orig_cache: ActivationCache,
     new_cache: ActivationCache,
     seq_pos: _SeqPos = None,
     apply_metric_to_cache: bool = False,
+    names_filter_for_cache_metric: Optional[Callable] = None,
     direct_includes_mlps: bool = True,
 ) -> Float[Tensor, ""]:
     '''
@@ -592,7 +594,7 @@ def _path_patch_single(
                     diff[..., head_slice, :], model.W_O[sender_node.layer, head_slice],
                     "batch pos n_heads d_head, n_heads d_head d_model -> batch pos d_model"
                 )
-            # If not in these two cases, it's one of resid_pre/mid/post, and so should already be something with shape (batch, subseq_len, d_model)
+            # If not in these two cases, it's one of resid_pre/mid/post, or attn_out/mlp_out/result, and so should already be something with shape (batch, subseq_len, d_model)
             sender_diffs[sender_node] = diff
 
 
@@ -627,7 +629,10 @@ def _path_patch_single(
                         )
 
                     head_slice = slice(None) if (receiver_node.head is None) else [receiver_node.head]
-                    model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices, head_slice] += diff.unsqueeze(-2)
+                    # * TODO - why is this needed?
+                    if diff.shape != model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices, head_slice].shape:
+                        diff = diff.unsqueeze(-2)
+                    model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices, head_slice] += diff
                 
                 # The remaining case (given that we aren't handling "pre" here) is when receiver is resid_pre/mid/post
                 else:
@@ -641,13 +646,18 @@ def _path_patch_single(
 
     # Run model on orig with receiver nodes patched from previously cached values.
     if apply_metric_to_cache:
-        _, cache = model.run_with_cache(orig_input, return_type=None)
+        _, cache = model.run_with_cache(orig_input, return_type=None, names_filter=names_filter_for_cache_metric)
         model.reset_hooks()
         return patching_metric(cache)
     else:
-        logits = model(orig_input)
-        model.reset_hooks()
-        return patching_metric(logits)
+        if isinstance(patching_metric, str):
+            loss = model(orig_input, return_type="loss", loss_per_token=(patching_metric=="loss_per_token"))
+            model.reset_hooks()
+            return loss
+        else:
+            logits = model(orig_input)
+            model.reset_hooks()
+            return patching_metric(logits)
     
 
 
@@ -657,14 +667,15 @@ def _path_patch_single(
 def path_patch(
     model: HookedTransformer,
     orig_input: Union[str, List[str], Int[Tensor, "batch seq_len"]],
-    new_input: Union[str, List[str], Int[Tensor, "batch seq_len"]],
-    sender_nodes: Union[IterNode, Node, List[Node]],
-    receiver_nodes: Union[IterNode, Node, List[Node]],
-    patching_metric: Callable,
+    new_input: Optional[Union[str, List[str], Int[Tensor, "batch seq_len"]]] = None,
+    sender_nodes: Union[IterNode, Node, List[Node]] = [],
+    receiver_nodes: Union[IterNode, Node, List[Node]] = [],
+    patching_metric: Union[Callable, Literal["loss", "loss_per_token"]] = "loss",
     orig_cache: Optional[ActivationCache] = None,
-    new_cache: Optional[ActivationCache] = None,
+    new_cache: Optional[Union[ActivationCache, Literal["zero"]]] = None,
     seq_pos: SeqPos = None,
     apply_metric_to_cache: bool = False,
+    names_filter_for_cache_metric: Optional[Callable] = None,
     direct_includes_mlps: bool = True,
     verbose: bool = False,
 ) -> Float[Tensor, "..."]:
@@ -730,14 +741,24 @@ def path_patch(
     # Make sure we aren't iterating over both senders and receivers
     assert not all([isinstance(receiver_nodes, IterNode), isinstance(sender_nodes, IterNode)]), "Can't iterate over both senders and receivers!"
 
+    # Check other arguments
+    assert any([isinstance(new_cache, ActivationCache), new_cache == "zero", new_cache is None]), "Invalid new_cache argument."
+    # assert (new_input is not None) or (new_cache == "zero"), "If new_cache is not 'zero' then you must provide new_input."
+    if isinstance(patching_metric, str): assert patching_metric in ["loss", "loss_per_token"], "Invalid patching_metric argument."
+    assert not(isinstance(patching_metric, str) and apply_metric_to_cache), "Can't apply metric to cache if metric is 'loss' or 'loss_per_token'."
+    assert sender_nodes != [], "You must specify sender nodes."
+    assert receiver_nodes != [], "You must specify receiver nodes."
+
     # ========== Step 1 ==========
     # Gather activations on orig and new distributions (we only need attn heads and possibly MLPs)
     # This is so that we can patch/freeze during step 2
-    if new_cache is None:
-        _, new_cache = model.run_with_cache(new_input, return_type="logits", names_filter=relevant_names_filter)
     if orig_cache is None:
-        _, orig_cache = model.run_with_cache(orig_input, return_type=None, names_filter=relevant_names_filter)
-    
+        _, orig_cache = model.run_with_cache(orig_input, return_type=None)
+    if new_cache == "zero":
+        new_cache = ActivationCache({k: t.zeros_like(v) for k, v in orig_cache.items()}, model=model)
+    elif new_cache is None:
+        _, new_cache = model.run_with_cache(new_input, return_type=None, names_filter=relevant_names_filter)
+
 
     # Get out backend patching function (fix all the arguments we won't be changing)
     path_patch_single = partial(
@@ -751,6 +772,7 @@ def path_patch(
         new_cache=new_cache,
         # seq_pos=seq_pos,
         apply_metric_to_cache=apply_metric_to_cache,
+        names_filter_for_cache_metric=names_filter_for_cache_metric,
         direct_includes_mlps=direct_includes_mlps,
     )
 
@@ -808,8 +830,8 @@ def _act_patch_single(
     model: HookedTransformer,
     orig_input: Union[str, List[str], Int[Tensor, "batch pos"]],
     patching_nodes: Union[Node, List[Node]],
-    patching_metric: Callable,
-    new_cache: ActivationCache,
+    patching_metric: Union[Callable, Literal["loss", "loss_per_token"]],
+    new_cache: Union[ActivationCache, Literal["zero"]],
     apply_metric_to_cache: bool = False,
 ) -> Float[Tensor, ""]:
     '''Same principle as path patching, but we just patch a single activation at the 'activation' node.'''
@@ -832,27 +854,38 @@ def _act_patch_single(
         model.reset_hooks()
         return patching_metric(cache)
     else:
-        logits = model(orig_input)
-        model.reset_hooks()
-        return patching_metric(logits)
+        if isinstance(patching_metric, str):
+            loss = model(orig_input, return_type="loss", loss_per_token=(patching_metric == "loss_per_token"))
+            model.reset_hooks()
+            return loss
+        else:
+            logits = model(orig_input)
+            model.reset_hooks()
+            return patching_metric(logits)
 
 
 def act_patch(
     model: HookedTransformer,
     orig_input: Union[str, List[str], Int[Tensor, "batch seq_len"]],
     patching_nodes: Union[IterNode, Node, List[Node]],
-    patching_metric: Callable,
+    patching_metric: Union[Callable, Literal["loss", "loss_per_token"]],
     new_input: Optional[Union[str, List[str], Int[Tensor, "batch seq_len"]]] = None,
     new_cache: Optional[ActivationCache] = None,
     apply_metric_to_cache: bool = False,
     verbose: bool = False,
 ) -> Float[Tensor, "..."]:
 
+    # Check some arguments
     assert (new_input is not None) or (new_cache is not None), "Must specify either new_input or new_cache."
+    if isinstance(patching_metric, str): assert patching_metric in ["loss", "loss_per_token"]
+    assert not(isinstance(patching_metric, str) and apply_metric_to_cache)
 
-    if new_cache is None:
+    # Get our cache for patching in (might be zero cache)
+    if new_cache == "zero":
+        _, cache = model.run_with_cache(orig_input, return_type=None)
+        new_cache = ActivationCache({k: t.zeros_like(v) for k, v in cache.items()}, model=model)
+    elif new_cache is None:
         _, new_cache = model.run_with_cache(new_input, return_type=None)
-
 
     # Get out backend patching function (fix all the arguments we won't be changing)
     act_patch_single = partial(
