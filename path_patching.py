@@ -608,26 +608,25 @@ def _path_patch_single(
                 if not (sender_node < receiver_node):
                     continue
 
-                # q/k/v should be converted into q_input/k_input/v_input
                 if receiver_node.component_name in ["q", "k", "v", "q_input", "k_input", "v_input"]:
-
                     assert model.cfg.use_split_qkv_input, "Direct patching (direct_includes_mlps=False) requires use_split_qkv_input=True. Please change your model config."
-
-                    # Only need to convert once (this edits the receiver_nodes list)
-                    if receiver_node.component_name in ["q", "k", "v"]:
+                    
+                    # q/k/v should be converted into q_input/k_input/v_input
+                    if receiver_node.component_name in ["q", "k", "v"]: 
                         receiver_node = Node(f"{receiver_node.component_name}_input", layer=receiver_node.layer, head=receiver_node.head)
                         receiver_nodes[i] = receiver_node
 
-                    # If this is the first time we've used a receiver node within this activation, we populate the context dict
-                    # (and add hooks to eventually do patching)
-                    if len(model.hook_dict[receiver_node.activation_name].ctx) == 0:
-                        model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"] = t.zeros_like(orig_cache[receiver_node.activation_name])
-                        model.add_hook(
-                            receiver_node.activation_name,
-                            partial(hook_fn_generic_patching_from_context, name="receiver_activations", add=True), 
-                            level=1
-                        )
+                # If this is the first time we've used a receiver node within this activation, we populate the context dict
+                # (and add hooks to eventually do patching)
+                if len(model.hook_dict[receiver_node.activation_name].ctx) == 0:
+                    model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"] = t.zeros_like(orig_cache[receiver_node.activation_name])
+                    model.add_hook(
+                        receiver_node.activation_name,
+                        partial(hook_fn_generic_patching_from_context, name="receiver_activations", add=True), 
+                        level=1
+                    )
 
+                if receiver_node.component_name in ["q_input", "k_input", "v_input"]:
                     head_slice = slice(None) if (receiver_node.head is None) else [receiver_node.head]
                     # * TODO - why is this needed?
                     if diff.shape != model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices, head_slice].shape:
@@ -637,9 +636,6 @@ def _path_patch_single(
                 # The remaining case (given that we aren't handling "pre" here) is when receiver is resid_pre/mid/post
                 else:
                     assert "resid_" in receiver_node.component_name
-                    # If this is the first time we've used a receiver node within this activation, we populate the context dict
-                    if len(model.hook_dict[receiver_node.activation_name].ctx) == 0:
-                        model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"] = t.zeros_like(orig_cache[receiver_node.activation_name])
                     model.hook_dict[receiver_node.activation_name].ctx["receiver_activations"][batch_indices, seq_pos_indices] += diff
                 
 
